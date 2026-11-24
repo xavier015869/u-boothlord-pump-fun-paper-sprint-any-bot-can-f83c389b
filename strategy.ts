@@ -163,6 +163,24 @@ function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
   return q - (q * FEE_BPS + BPS - 1n) / BPS;
 }
 
+/** True when `value` sits at least `bps` above `basis` (both in lamports). */
+function crossedAbove(value: bigint, basis: bigint, bps: bigint): boolean {
+  return value * BPS >= basis * (BPS + bps);
+}
+
+/** True when `value` sits at least `bps` below `basis` (both in lamports). */
+function crossedBelow(value: bigint, basis: bigint, bps: bigint): boolean {
+  return value * BPS <= basis * (BPS - bps);
+}
+
+/** Bookkeeping once a buy for `c` goes out: count it, charge it, remember the curve it was priced on. */
+function noteBuy(c: Coin, amount: bigint, vq: bigint, vt: bigint): void {
+  c.buysSent += 1;
+  c.spentSent += amount;
+  c.lastBuyVq = vq;
+  c.lastBuyVt = vt;
+}
+
 export interface Strategy {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 }
@@ -280,6 +298,30 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     return net;
   }
 
+  /**
+   * Rug filter: the creator put real money in (but not a bundle-sized
+   * amount), only a few other wallets are in yet, nobody has dumped.
+   * The checks run in the original entry-site order; the flow check stays
+   * last because flow() prunes c.recent as a side effect.
+   */
+  function passesRugFilter(c: Coin, rq: bigint, slot: number): boolean {
+    if (rq < BigInt(P.minRealSol) || rq > BigInt(P.maxRealSol)) return false;
+    if (c.devBuy < BigInt(P.minDevBuy) || c.devBuy > BigInt(P.maxDevBuy)) return false;
+    if (c.buyers.size < P.minBuyers || c.buyers.size > P.maxBuyers) return false;
+    if (c.boughtByOthers < BigInt(P.minBoughtLamports)) return false;
+    if (c.bought > 0n && c.soldByOthers * BPS > c.bought * BigInt(P.maxSellRatioBps)) return false;
+    if (flow(c, slot) < BigInt(P.minFlowLamports)) return false;
+    return true;
+  }
+
+  /**
+   * Trailing stop: armed once the best value seen is trailArmBps over the
+   * basis; hit when the current value has fallen trailBps under that best.
+   */
+  function trailingStopHit(best: bigint, basis: bigint, value: bigint): boolean {
+    return crossedAbove(best, basis, BigInt(P.trailArmBps)) && crossedBelow(value, best, BigInt(P.trailBps));
+  }
+
   function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
     for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'buy') return true;
     return false;
@@ -345,7 +387,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (value > h.best) h.best = value;
         let exit = false;
         if (basis > 0n) {
-          if (!h.tookTp1 && value * BPS >= basis * (BPS + BigInt(P.tp1Bps))) {
+          if (!h.tookTp1 && crossedAbove(value, basis, BigInt(P.tp1Bps))) {
             const part = (pos.token_amount * BigInt(P.tp1PartBps)) / BPS;
             if (part > 0n && part < pos.token_amount) {
               orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
@@ -355,10 +397,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
               continue;
             }
           }
-          if (value * BPS >= basis * (BPS + BigInt(P.tpBps))) exit = true;
+          if (crossedAbove(value, basis, BigInt(P.tpBps))) exit = true;
           const sl = h.tookTp1 ? BigInt(P.slAfterTp1Bps) : BigInt(P.slBps);
-          if (value * BPS <= basis * (BPS - sl)) exit = true;
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
+          if (crossedBelow(value, basis, sl)) exit = true;
+          if (trailingStopHit(h.best, basis, value)) exit = true;
         }
         if (state.slot - h.openedSlot >= P.maxHold) exit = true;
         if (c !== undefined) {
@@ -396,6 +438,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
         const vq = curve.virtual_quote_reserves;
         const vt = curve.virtual_token_reserves;
+        if (vq <= 0n || vt <= 0n) continue;
         if (isAdd) {
           // Pyramid into a winner only: the position is up, the price stepped up
           // from the last buy, and fresh money still flows in.
@@ -416,21 +459,11 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           const add = buyOrders(c.mint, amount, k, cap - orders.length);
           orders.push(...add);
           free -= amount + tx * BigInt(add.length);
-          c.buysSent += 1;
-          c.spentSent += amount;
-          c.lastBuyVq = vq;
-          c.lastBuyVt = vt;
+          noteBuy(c, amount, vq, vt);
           continue;
         }
-        // Rug filter: the creator put real money in (but not a bundle-sized
-        // amount), only a few other wallets are in yet, nobody has dumped.
         const rq = curve.real_quote_reserves;
-        if (rq < BigInt(P.minRealSol) || rq > BigInt(P.maxRealSol)) continue;
-        if (c.devBuy < BigInt(P.minDevBuy) || c.devBuy > BigInt(P.maxDevBuy)) continue;
-        if (c.buyers.size < P.minBuyers || c.buyers.size > P.maxBuyers) continue;
-        if (c.boughtByOthers < BigInt(P.minBoughtLamports)) continue;
-        if (c.bought > 0n && c.soldByOthers * BPS > c.bought * BigInt(P.maxSellRatioBps)) continue;
-        if (flow(c, state.slot) < BigInt(P.minFlowLamports)) continue;
+        if (!passesRugFilter(c, rq, state.slot)) continue;
         const room = stake - c.spentSent;
         if (room < minBuy) continue;
         const maxBuy = state.maxBuyLamports(c.mint);
@@ -440,10 +473,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         const buys = buyOrders(c.mint, amount, k, cap - orders.length);
         orders.push(...buys);
         free -= amount + tx * BigInt(buys.length);
-        c.buysSent += 1;
-        c.spentSent += amount;
-        c.lastBuyVq = vq;
-        c.lastBuyVt = vt;
+        noteBuy(c, amount, vq, vt);
         open += 1;
       }
       return orders;
